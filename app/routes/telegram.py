@@ -3,6 +3,7 @@ Telegram Webhook Handler
 """
 
 import logging
+from typing import Optional
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 
 from app.models.schemas import TelegramWebhook
