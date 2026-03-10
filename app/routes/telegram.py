@@ -1,9 +1,9 @@
 """
-Telegram Webhook Handler - Safe Implementation
+Telegram Webhook Handler - Fixed Implementation
 """
 
 import logging
-from typing import Optional
+from typing import Optional, List
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 
 from app.models.schemas import TelegramWebhook
@@ -19,15 +19,50 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def is_chase_statement(text: str) -> bool:
+    """Chase statement 감지 - 강력한 규칙"""
+    if not text:
+        return False
+    
+    text_lower = text.lower()
+    
+    chase_indicators = [
+        'printed from chase personal online',
+        'total checking',
+        'chase.com',
+        'secure.chase.com',
+        'transactions showing',
+        'date description type amount balance',
+    ]
+    
+    for indicator in chase_indicators:
+        if indicator in text_lower:
+            logger.info(f"Chase statement detected by: {indicator}")
+            return True
+    
+    if 'chase' in text_lower and ('checking' in text_lower or 'account' in text_lower):
+        if 'zelle' in text_lower or 'pos debit' in text_lower:
+            logger.info("Chase statement detected by combined indicators")
+            return True
+    
+    return False
+
+
 def is_valid_expense(expense) -> bool:
     """지출 유효성 검사"""
     merchant = getattr(expense, "merchant", None)
     total = getattr(expense, "total", None)
     date = getattr(expense, "transaction_date", None)
     
-    # 핵심 필드 모두 없으면 invalid
-    if (not merchant or merchant == "Unknown") and (not date) and (not total or float(total) == 0):
+    if merchant and 'printed from chase' in str(merchant).lower():
+        logger.warning(f"Filtered Chase header as merchant: {merchant}")
         return False
+    
+    if (not merchant or str(merchant).lower() in ['unknown', '']) and \
+       (not date) and \
+       (not total or float(total) == 0):
+        return False
+    
     return True
 
 
@@ -36,7 +71,7 @@ async def telegram_webhook(
     request: Request,
     background_tasks: BackgroundTasks
 ):
-    """Telegram Webhook - 안전한 구현"""
+    """Telegram Webhook - fixed"""
     try:
         data = await request.json()
         webhook = TelegramWebhook(**data)
@@ -44,7 +79,9 @@ async def telegram_webhook(
         chat_id = webhook.get_chat_id()
         file_id = webhook.get_file_id()
         caption = webhook.get_caption()
-        filename = webhook.get_document_filename()
+        filename = webhook.get_document_filename() or ""
+        
+        logger.info(f"Webhook received: chat_id={chat_id}, filename={filename}")
         
         if not chat_id:
             return {"ok": True}
@@ -54,34 +91,44 @@ async def telegram_webhook(
             await sender.send_message(chat_id, "📎 파일을 별내주세요!")
             return {"ok": True}
         
-        # 파일 다운로드
         downloader = TelegramFileDownloader()
         file_path, file_type = await downloader.download(file_id)
+        logger.info(f"Downloaded: {file_path} ({file_type})")
         
-        # PDF 텍스트 읽기 (감지용)
         pdf_text = None
-        if file_type == 'pdf':
+        is_pdf = file_path.endswith('.pdf')
+        
+        if is_pdf:
             try:
                 processor = PDFProcessor()
                 pdf_text = processor.extract_text(file_path)
-            except:
-                pass
+                logger.info(f"PDF text extracted: {len(pdf_text) if pdf_text else 0} chars")
+            except Exception as e:
+                logger.warning(f"PDF text extraction failed: {e}")
         
-        # 문서 타입 감지
         is_statement = False
-        if pdf_text and 'chase' in pdf_text.lower() and 'total checking' in pdf_text.lower():
+        
+        if pdf_text and is_chase_statement(pdf_text):
             is_statement = True
-        elif filename and any(kw in filename.lower() for kw in ['statement', 'chase', 'transactions']):
+            logger.info("Detected as Chase statement by content")
+        elif any(kw in filename.lower() for kw in ['statement', 'chase', 'transactions', 'activity']):
+            is_statement = True
+            logger.info("Detected as statement by filename")
+        elif caption and any(kw in caption.lower() for kw in ['명세서', 'statement', '거래내역']):
+            is_statement = True
+            logger.info("Detected as statement by caption")
+        elif is_pdf and not is_statement:
+            logger.info("Defaulting PDF to statement mode")
             is_statement = True
         
         logger.info(f"Document type: {'statement' if is_statement else 'receipt'}")
         
-        # 라우팅
         if is_statement:
             background_tasks.add_task(
                 process_statement,
                 chat_id=chat_id,
                 file_path=file_path,
+                pdf_text=pdf_text,
                 filename=filename
             )
         else:
@@ -106,17 +153,17 @@ async def process_receipt(
     filename: str,
     caption: Optional[str] = None
 ):
-    """영수증 처리 - 안전한 구현"""
+    """영수증 처리 - fixed"""
     sender = TelegramSender()
     
     try:
-        await sender.send_message(chat_id, "🔍 문서를 분석하는 중...")
+        await sender.send_message(chat_id, "🔍 영수증을 분석하는 중...")
+        logger.info(f"Processing receipt: {filename}")
         
-        # 추출
         extractor = ExpenseExtractionService()
         
-        file_type = 'pdf' if file_path.endswith('.pdf') else 'image'
-        if file_type == "pdf":
+        is_pdf = file_path.endswith('.pdf')
+        if is_pdf:
             processor = PDFProcessor()
             raw_text = processor.extract_text(file_path)
             images = processor.convert_to_images(file_path)
@@ -130,107 +177,122 @@ async def process_receipt(
             caption=caption
         )
         
-        # Validation: 유효하지 않으면 저장 안 함
+        logger.info(f"Extracted: merchant={expense.merchant}, total={expense.total}, date={expense.transaction_date}")
+        
         if not is_valid_expense(expense):
-            logger.warning(f"Invalid expense: merchant={expense.merchant}, total={expense.total}")
+            logger.warning(f"Invalid expense, blocking save: {expense.merchant}, {expense.total}")
             await sender.send_message(
                 chat_id,
-                "❌ 문서에서 유효한 지출 정보를 추출하지 못했습니다.\n"
-                "PDF 명세서인 경우 파일명에 'statement'를 포함해주세요."
+                "❌ 유효한 지출 정보를 추출하지 못했습니다.\n"
+                "PDF 명세서는 'statement'가 포함된 파일명으로 별내주세요."
             )
             return
         
-        # 카테고리 분류
         categorizer = Categorizer()
         expense = categorizer.categorize(expense)
+        logger.info(f"Categorized: {expense.category}")
         
-        # 중복 검사 (try/except로 보호)
         try:
             deduper = DuplicateChecker()
-            dup_result = await deduper.check(expense)  # check_expense -> check
+            dup_result = await deduper.check(expense)
             is_duplicate = dup_result.get("is_duplicate", False)
+            logger.info(f"Duplicate check: {is_duplicate}")
         except Exception as e:
-            logger.error(f"Duplicate check failed: {e}")
+            logger.error(f"Duplicate check error: {e}")
             is_duplicate = False
         
         if is_duplicate:
-            await sender.send_message(
-                chat_id,
-                "⚠️ 비슷한 지출이 이미 저장된 것 같아요. 중복 저장은 걄뛰었습니다."
-            )
+            await sender.send_message(chat_id, "⚠️ 중복 지출이 감지되었습니다.")
             return
         
-        # 저장
-        await sender.send_message(chat_id, "💾 Notion에 저장하는 중...")
+        await sender.send_message(chat_id, "💾 저장하는 중...")
         notion = NotionWriter()
-        result = await notion.save_expense(expense)
         
-        if result.success:
-            await sender.send_message(
-                chat_id,
-                f"✅ 지출 기록 완료\n\n"
-                f"🏪 {expense.merchant or '미확인'}\n"
-                f"📅 {expense.transaction_date or '날짜 미확인'}\n"
-                f"💰 {expense.total or 0} {expense.currency}"
-            )
-        else:
-            await sender.send_message(chat_id, "❌ 저장에 실패했습니다.")
+        try:
+            result = await notion.save_expense(expense)
+            if result.success:
+                await sender.send_message(
+                    chat_id,
+                    f"✅ 저장 완료\n\n"
+                    f"🏪 {expense.merchant}\n"
+                    f"📅 {expense.transaction_date}\n"
+                    f"💰 {expense.total} {expense.currency}"
+                )
+            else:
+                logger.error(f"Notion save failed: {result.error}")
+                await sender.send_message(chat_id, "❌ 저장에 실패했습니다.")
+        except Exception as e:
+            logger.error(f"Notion save error: {e}")
+            await sender.send_message(chat_id, "❌ 저장 중 오류가 발생했습니다.")
         
     except Exception as e:
         logger.error(f"Receipt processing error: {e}", exc_info=True)
         await sender.send_message(chat_id, "❌ 처리 중 오류가 발생했습니다.")
-    finally:
-        # cleanup
-        pass
 
 
 async def process_statement(
     chat_id: int,
     file_path: str,
+    pdf_text: Optional[str],
     filename: str
 ):
-    """명세서 처리"""
+    """명세서 처리 - Chase 지원"""
     sender = TelegramSender()
     
     try:
         await sender.send_message(chat_id, "📄 명세서를 분석하는 중...")
-        
-        processor = PDFProcessor()
-        pdf_text = processor.extract_text(file_path)
+        logger.info(f"Processing statement: {filename}")
         
         if not pdf_text:
             await sender.send_message(chat_id, "❌ PDF에서 텍스트를 읽을 수 없습니다.")
             return
         
         extractor = ExpenseExtractionService()
-        statement = await extractor.extract_statement(pdf_text, filename)
+        transactions = await extractor.extract_statement(pdf_text, filename)
         
-        if not statement.transactions:
-            await sender.send_message(chat_id, "❌ 거래 내역을 찾을 수 없습니다.")
+        logger.info(f"Parsed {len(transactions)} transactions from Chase statement")
+        
+        if not transactions:
+            await sender.send_message(
+                chat_id,
+                "❌ 거래 내역을 찾을 수 없습니다.\n"
+                "Chase 명세서 형식이 변경되었을 수 있습니다."
+            )
             return
         
-        # 유효한 거래만
-        valid_txs = [tx for tx in statement.transactions if tx.amount != 0]
+        valid_txs = [tx for tx in transactions if tx.amount != 0 and tx.description]
+        logger.info(f"Valid transactions: {len(valid_txs)}")
         
-        await sender.send_message(
-            chat_id,
-            f"💾 {len(valid_txs)}개 거래를 저장하는 중..."
-        )
+        if not valid_txs:
+            await sender.send_message(chat_id, "❌ 유효한 거래를 찾을 수 없습니다.")
+            return
         
-        # 저장
+        await sender.send_message(chat_id, f"💾 {len(valid_txs)}개 거래를 저장하는 중...")
+        
         notion = NotionWriter()
         saved = 0
+        failed = 0
+        
         for tx in valid_txs:
             try:
                 result = await notion.save_transaction(tx)
                 if result.success:
                     saved += 1
-            except:
-                pass
+                else:
+                    failed += 1
+                    logger.warning(f"Failed to save transaction: {result.error}")
+            except Exception as e:
+                failed += 1
+                logger.error(f"Transaction save error: {e}")
+        
+        logger.info(f"Saved: {saved}, Failed: {failed}")
         
         await sender.send_message(
             chat_id,
-            f"✅ {saved}/{len(valid_txs)}개 거래 저장 완료"
+            f"✅ 처리 완료\n\n"
+            f"📊 거래: {len(valid_txs)}개\n"
+            f"💾 저장성공: {saved}개\n"
+            f"❌ 저장실패: {failed}개"
         )
         
     except Exception as e:
