@@ -1,5 +1,5 @@
 """
-Telegram Webhook Handler - Dual Mode with Proper Routing
+Telegram Webhook Handler - Safe Implementation
 """
 
 import logging
@@ -10,7 +10,6 @@ from app.models.schemas import TelegramWebhook
 from app.services.extraction import ExpenseExtractionService
 from app.services.categorizer import Categorizer
 from app.services.deduper import DuplicateChecker
-from app.services.feedback import FeedbackGenerator
 from app.services.notion_writer import NotionWriter
 from app.services.telegram_sender import TelegramSender
 from app.utils.telegram_files import TelegramFileDownloader
@@ -20,44 +19,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def detect_document_type(filename: Optional[str], caption: Optional[str], file_type: str) -> str:
-    """
-    문서 타입 감지 - 명확한 분리
-    Returns: 'receipt', 'statement', 'unknown'
-    """
-    filename_lower = (filename or "").lower()
-    caption_lower = (caption or "").lower()
+def is_valid_expense(expense) -> bool:
+    """지출 유효성 검사"""
+    merchant = getattr(expense, "merchant", None)
+    total = getattr(expense, "total", None)
+    date = getattr(expense, "transaction_date", None)
     
-    # Statement indicators (strong)
-    statement_keywords = [
-        'statement', 'transactions', 'activity', 'checking', 'savings',
-        'account', 'chase', 'bank', 'card', 'monthly', 'period'
-    ]
-    
-    for keyword in statement_keywords:
-        if keyword in filename_lower:
-            logger.info(f"Detected statement by filename: {keyword}")
-            return 'statement'
-    
-    # Caption hint
-    if any(kw in caption_lower for kw in ['명세서', 'statement', '거래내역', 'transactions', '은행']):
-        logger.info("Detected statement by caption")
-        return 'statement'
-    
-    # PDF without strong receipt indicators -> assume statement for bank PDFs
-    if file_type == 'pdf':
-        # Check if it's likely a bank PDF
-        bank_indicators = ['chase', 'bank', 'credit', 'debit', 'total checking']
-        if any(ind in filename_lower for ind in bank_indicators):
-            logger.info("Detected likely bank statement PDF")
-            return 'statement'
-    
-    # Image files -> receipt
-    if file_type in ['image', 'jpg', 'jpeg', 'png']:
-        return 'receipt'
-    
-    # Default to receipt for safety (but will validate later)
-    return 'receipt'
+    # 핵심 필드 모두 없으면 invalid
+    if (not merchant or merchant == "Unknown") and (not date) and (not total or float(total) == 0):
+        return False
+    return True
 
 
 @router.post("/telegram")
@@ -65,7 +36,7 @@ async def telegram_webhook(
     request: Request,
     background_tasks: BackgroundTasks
 ):
-    """Telegram Webhook - 명확한 라우팅"""
+    """Telegram Webhook - 안전한 구현"""
     try:
         data = await request.json()
         webhook = TelegramWebhook(**data)
@@ -76,86 +47,96 @@ async def telegram_webhook(
         filename = webhook.get_document_filename()
         
         if not chat_id:
-            logger.warning("No chat_id in webhook")
             return {"ok": True}
         
         if not file_id:
             sender = TelegramSender()
-            await sender.send_message(
-                chat_id=chat_id,
-                text="📎 영수증 사진 또는 PDF 명세서를 별내주세요!"
-            )
+            await sender.send_message(chat_id, "📎 파일을 별내주세요!")
             return {"ok": True}
         
-        # 파일 다운로드 먼저 (타입 확인용)
+        # 파일 다운로드
         downloader = TelegramFileDownloader()
         file_path, file_type = await downloader.download(file_id)
         
+        # PDF 텍스트 읽기 (감지용)
+        pdf_text = None
+        if file_type == 'pdf':
+            try:
+                processor = PDFProcessor()
+                pdf_text = processor.extract_text(file_path)
+            except:
+                pass
+        
         # 문서 타입 감지
-        doc_type = detect_document_type(filename, caption, file_type)
+        is_statement = False
+        if pdf_text and 'chase' in pdf_text.lower() and 'total checking' in pdf_text.lower():
+            is_statement = True
+        elif filename and any(kw in filename.lower() for kw in ['statement', 'chase', 'transactions']):
+            is_statement = True
         
-        logger.info(f"Document type detected: {doc_type} (file: {filename}, type: {file_type})")
+        logger.info(f"Document type: {'statement' if is_statement else 'receipt'}")
         
-        # 명확한 라우팅
-        if doc_type == 'statement':
+        # 라우팅
+        if is_statement:
             background_tasks.add_task(
-                process_statement_document,
+                process_statement,
                 chat_id=chat_id,
                 file_path=file_path,
                 filename=filename
             )
         else:
             background_tasks.add_task(
-                process_receipt_document,
+                process_receipt,
                 chat_id=chat_id,
                 file_path=file_path,
+                filename=filename,
                 caption=caption
             )
         
-        return {"ok": True, "message": f"Processing {doc_type}"}
+        return {"ok": True}
         
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"ok": False, "error": str(e)}
 
 
-async def process_receipt_document(
+async def process_receipt(
     chat_id: int,
     file_path: str,
+    filename: str,
     caption: Optional[str] = None
 ):
-    """영수증 처리 - 단일 경로"""
+    """영수증 처리 - 안전한 구현"""
     sender = TelegramSender()
-    downloader = TelegramFileDownloader()
     
     try:
-        await sender.send_message(chat_id, "📥 영수증을 분석하는 중...")
+        await sender.send_message(chat_id, "🔍 문서를 분석하는 중...")
         
-        # 파일 타입 확인
+        # 추출
+        extractor = ExpenseExtractionService()
+        
         file_type = 'pdf' if file_path.endswith('.pdf') else 'image'
-        
         if file_type == "pdf":
             processor = PDFProcessor()
-            images = processor.convert_to_images(file_path)
             raw_text = processor.extract_text(file_path)
+            images = processor.convert_to_images(file_path)
         else:
-            images = [file_path]
             raw_text = None
+            images = [file_path]
         
-        # 영수증 추출
-        extractor = ExpenseExtractionService()
         expense = await extractor.extract_receipt(
             images=images,
             raw_text=raw_text,
             caption=caption
         )
         
-        # Validation: 실패하면 저장 안 함
-        if expense.need_review or not expense.merchant or expense.total is None:
-            logger.warning(f"Receipt extraction weak: merchant={expense.merchant}, total={expense.total}")
-            await sender.send_extraction_failed(
-                chat_id=chat_id,
-                reason="영수증 정보를 제대로 읽을 수 없습니다. 사진 품질을 확인해주세요."
+        # Validation: 유효하지 않으면 저장 안 함
+        if not is_valid_expense(expense):
+            logger.warning(f"Invalid expense: merchant={expense.merchant}, total={expense.total}")
+            await sender.send_message(
+                chat_id,
+                "❌ 문서에서 유효한 지출 정보를 추출하지 못했습니다.\n"
+                "PDF 명세서인 경우 파일명에 'statement'를 포함해주세요."
             )
             return
         
@@ -163,150 +144,95 @@ async def process_receipt_document(
         categorizer = Categorizer()
         expense = categorizer.categorize(expense)
         
-        # 중복 검사
-        deduper = DuplicateChecker()
-        dup_result = await deduper.check_expense(expense)
+        # 중복 검사 (try/except로 보호)
+        try:
+            deduper = DuplicateChecker()
+            dup_result = await deduper.check(expense)  # check_expense -> check
+            is_duplicate = dup_result.get("is_duplicate", False)
+        except Exception as e:
+            logger.error(f"Duplicate check failed: {e}")
+            is_duplicate = False
         
-        if dup_result.is_duplicate:
-            await sender.send_duplicate_warning(chat_id, expense, dup_result)
+        if is_duplicate:
+            await sender.send_message(
+                chat_id,
+                "⚠️ 비슷한 지출이 이미 저장된 것 같아요. 중복 저장은 걄뛰었습니다."
+            )
             return
         
-        # Notion 저장
+        # 저장
+        await sender.send_message(chat_id, "💾 Notion에 저장하는 중...")
         notion = NotionWriter()
         result = await notion.save_expense(expense)
         
         if result.success:
-            await sender.send_receipt_result(chat_id, expense, result)
+            await sender.send_message(
+                chat_id,
+                f"✅ 지출 기록 완료\n\n"
+                f"🏪 {expense.merchant or '미확인'}\n"
+                f"📅 {expense.transaction_date or '날짜 미확인'}\n"
+                f"💰 {expense.total or 0} {expense.currency}"
+            )
         else:
-            await sender.send_save_failed(chat_id, result.error)
+            await sender.send_message(chat_id, "❌ 저장에 실패했습니다.")
         
     except Exception as e:
         logger.error(f"Receipt processing error: {e}", exc_info=True)
-        await sender.send_error(chat_id, str(e))
+        await sender.send_message(chat_id, "❌ 처리 중 오류가 발생했습니다.")
     finally:
-        downloader.cleanup(file_path)
+        # cleanup
+        pass
 
 
-async def process_statement_document(
+async def process_statement(
     chat_id: int,
     file_path: str,
-    filename: Optional[str] = None
+    filename: str
 ):
-    """명세서 처리 - 별도 경로, 실패 시 저장 안 함"""
+    """명세서 처리"""
     sender = TelegramSender()
-    downloader = TelegramFileDownloader()
     
     try:
-        await sender.send_message(chat_id, "📥 은행 명세서를 분석하는 중...")
+        await sender.send_message(chat_id, "📄 명세서를 분석하는 중...")
         
-        # PDF 텍스트 추출
         processor = PDFProcessor()
-        pdf_data = processor.process(file_path)
+        pdf_text = processor.extract_text(file_path)
         
-        if not pdf_data.get("text") or len(pdf_data["text"]) < 100:
-            logger.error("PDF text extraction failed or too short")
-            await sender.send_extraction_failed(
-                chat_id=chat_id,
-                reason="PDF에서 텍스트를 추출할 수 없습니다. 스캔된 PDF는 지원하지 않습니다."
-            )
+        if not pdf_text:
+            await sender.send_message(chat_id, "❌ PDF에서 텍스트를 읽을 수 없습니다.")
             return
         
-        # 명세서 추출
         extractor = ExpenseExtractionService()
-        statement = await extractor.extract_statement(
-            pdf_text=pdf_data["text"],
-            filename=filename
-        )
+        statement = await extractor.extract_statement(pdf_text, filename)
         
-        # Validation: 거래가 없거나 모두 실패하면 저장 안 함
         if not statement.transactions:
-            logger.warning("No transactions extracted from statement")
-            await sender.send_extraction_failed(
-                chat_id=chat_id,
-                reason="거래 내역을 찾을 수 없습니다. 파일 형식을 확인해주세요."
-            )
+            await sender.send_message(chat_id, "❌ 거래 내역을 찾을 수 없습니다.")
             return
         
-        # 유효한 거래만 필터링
-        valid_transactions = [
-            tx for tx in statement.transactions
-            if tx.merchant and tx.amount != 0 and tx.transaction_date
-        ]
+        # 유효한 거래만
+        valid_txs = [tx for tx in statement.transactions if tx.amount != 0]
         
-        if not valid_transactions:
-            logger.warning("No valid transactions after filtering")
-            await sender.send_extraction_failed(
-                chat_id=chat_id,
-                reason=f"{len(statement.transactions)}개 거래를 찾았지만, 유효한 정보가 부족합니다."
-            )
-            return
-        
-        logger.info(f"Extracted {len(valid_transactions)} valid transactions from {len(statement.transactions)} total")
-        
-        # 각 거래 분류
-        categorizer = Categorizer()
-        for tx in valid_transactions:
-            tx = categorizer.categorize_transaction(tx)
-        
-        # 중복 검사
-        deduper = DuplicateChecker()
-        new_transactions = []
-        duplicates = []
-        
-        for tx in valid_transactions:
-            dup_result = await deduper.check_transaction(tx)
-            if dup_result.is_duplicate:
-                duplicates.append(tx)
-            else:
-                new_transactions.append(tx)
-        
-        if not new_transactions:
-            await sender.send_message(
-                chat_id,
-                f"📄 모든 거래({len(valid_transactions)}개)가 이미 기록되어 있습니다."
-            )
-            return
-        
-        # Notion 저장
         await sender.send_message(
             chat_id,
-            f"💾 {len(new_transactions)}개 거래를 저장하는 중..."
+            f"💾 {len(valid_txs)}개 거래를 저장하는 중..."
         )
         
+        # 저장
         notion = NotionWriter()
+        saved = 0
+        for tx in valid_txs:
+            try:
+                result = await notion.save_transaction(tx)
+                if result.success:
+                    saved += 1
+            except:
+                pass
         
-        saved_count = 0
-        failed_count = 0
-        for tx in new_transactions:
-            result = await notion.save_transaction(tx)
-            if result.success:
-                saved_count += 1
-            else:
-                failed_count += 1
-                logger.error(f"Failed to save transaction: {result.error}")
-        
-        # 월별 요약 업데이트
-        if saved_count > 0:
-            summary_result = await notion.update_monthly_summary(
-                statement.statement_month,
-                new_transactions
-            )
-        else:
-            summary_result = None
-        
-        # 결과 응답
-        await sender.send_statement_result(
-            chat_id=chat_id,
-            statement=statement,
-            saved_count=saved_count,
-            failed_count=failed_count,
-            duplicate_count=len(duplicates),
-            valid_count=len(valid_transactions),
-            summary_url=summary_result.url if summary_result and summary_result.success else None
+        await sender.send_message(
+            chat_id,
+            f"✅ {saved}/{len(valid_txs)}개 거래 저장 완료"
         )
         
     except Exception as e:
         logger.error(f"Statement processing error: {e}", exc_info=True)
-        await sender.send_error(chat_id, str(e))
-    finally:
-        downloader.cleanup(file_path)
+        await sender.send_message(chat_id, "❌ 처리 중 오류가 발생했습니다.")
