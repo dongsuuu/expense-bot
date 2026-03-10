@@ -55,6 +55,13 @@ class SaveResult(BaseModel):
     error: Optional[str] = None
 
 
+class DuplicateCheckResult(BaseModel):
+    """중복 검사 결과"""
+    is_duplicate: bool
+    matched_id: Optional[str] = None
+    confidence: float = 0.0
+
+
 class TelegramWebhook(BaseModel):
     """Telegram Webhook Payload"""
     update_id: int
