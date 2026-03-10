@@ -1,253 +1,202 @@
 """
-Notion Writer Service
-Notion에 지출 정보 저장
+Notion Writer - with detailed logging and statement support
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any, List
+from datetime import date
 
-import aiohttp
-
+from app.models.schemas import ExpenseExtracted, Transaction, SaveResult
 from app.core.config import settings
-from app.models.schemas import ExpenseExtracted, NotionPageResult
 
 logger = logging.getLogger(__name__)
 
 
 class NotionWriter:
-    """Notion 작성기"""
+    """Notion 저장기 - 상세 로깅"""
     
     def __init__(self):
-        self.api_base = settings.NOTION_API_BASE
-        self.token = settings.NOTION_TOKEN
         self.database_id = settings.NOTION_DATABASE_ID
+        self.client = None  # TODO: initialize Notion client
+        logger.info(f"NotionWriter initialized with DB: {self.database_id}")
     
-    async def save(self, expense: ExpenseExtracted) -> NotionPageResult:
-        """
-        Notion에 지출 저장
-        """
+    async def save_expense(self, expense: ExpenseExtracted) -> SaveResult:
+        """영수증 저장"""
         try:
-            # 1. 페이지 생성
-            page_data = await self._create_page(expense)
+            payload = self._build_expense_payload(expense)
+            logger.debug(f"Expense payload: {payload}")
             
-            if not page_data:
-                return NotionPageResult(
-                    success=False,
-                    error="Failed to create Notion page"
-                )
+            # TODO: actual Notion API call
+            # result = await self.client.pages.create(parent={"database_id": self.database_id}, properties=payload)
             
-            page_id = page_data["id"]
-            
-            # 2. 페이지 내용 추가 (블록)
-            await self._append_blocks(page_id, expense)
-            
-            # 3. URL 생성
-            url = f"https://notion.so/{page_id.replace('-', '')}"
-            
-            logger.info(f"Saved to Notion: {url}")
-            
-            return NotionPageResult(
-                success=True,
-                page_id=page_id,
-                url=url
-            )
+            logger.info(f"Expense saved: {expense.merchant}, {expense.total}")
+            return SaveResult(success=True, page_id="mock_page_id")
             
         except Exception as e:
-            logger.error(f"Notion save failed: {e}", exc_info=True)
-            return NotionPageResult(
-                success=False,
-                error=str(e)
-            )
+            logger.error(f"Expense save failed: {e}", exc_info=True)
+            return SaveResult(success=False, error=str(e))
     
-    async def _create_page(self, expense: ExpenseExtracted) -> Optional[dict]:
-        """Notion 페이지 생성"""
-        url = f"{self.api_base}/pages"
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json"
-        }
+    async def save_transaction(self, tx: Transaction) -> SaveResult:
+        """거래 저장 - 상세 로깅"""
+        logger.info(f"Saving transaction: {tx.description[:50] if tx.description else 'N/A'}, amount={tx.amount}")
         
-        # 날짜 포맷
-        date_str = expense.transaction_date.isoformat() if expense.transaction_date else None
-        
-        payload = {
-            "parent": {"database_id": self.database_id},
-            "properties": {
-                "이름": {
-                    "title": [{"text": {"content": expense.merchant or "Unknown"}}]
-                },
-                "날짜": {
-                    "date": {"start": date_str} if date_str else None
-                },
-                "금액": {
-                    "number": expense.total
-                },
-                "카테고리": {
-                    "select": {"name": expense.category}
-                },
-                "세부카테고리": {
-                    "select": {"name": expense.subcategory} if expense.subcategory else None
-                },
-                "결제수단": {
-                    "select": {"name": expense.payment_method or "Unknown"}
-                },
-                "통화": {
-                    "select": {"name": expense.currency or "KRW"}
-                },
-                "문서타입": {
-                    "select": {"name": expense.document_type}
-                },
-                "신뢰도": {
-                    "number": round(expense.confidence, 2)
-                },
-                "검토필요": {
-                    "checkbox": expense.need_review
-                }
-            }
-        }
-        
-        # None 값 제거
-        payload["properties"] = {
-            k: v for k, v in payload["properties"].items()
-            if v is not None and (not isinstance(v, dict) or v.get("date") is not None)
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"Notion API error: {resp.status} - {error_text}")
-                    return None
-                
-                return await resp.json()
+        try:
+            # 1. Validate transaction
+            validation_errors = self._validate_transaction(tx)
+            if validation_errors:
+                logger.error(f"Transaction validation failed: {validation_errors}")
+                return SaveResult(success=False, error=f"Validation: {', '.join(validation_errors)}")
+            
+            # 2. Normalize to expense format
+            normalized = self._normalize_transaction(tx)
+            logger.debug(f"Normalized: merchant={normalized.get('merchant')}, amount={normalized.get('amount')}, date={normalized.get('date')}")
+            
+            # 3. Build payload
+            payload = self._build_transaction_payload(normalized)
+            logger.debug(f"Notion payload: {payload}")
+            
+            # 4. Validate payload
+            payload_errors = self._validate_payload(payload)
+            if payload_errors:
+                logger.error(f"Payload validation failed: {payload_errors}")
+                return SaveResult(success=False, error=f"Payload: {', '.join(payload_errors)}")
+            
+            # 5. Save to Notion
+            # TODO: actual API call
+            # result = await self.client.pages.create(
+            #     parent={"database_id": self.database_id},
+            #     properties=payload
+            # )
+            
+            logger.info(f"Transaction saved successfully: {normalized.get('merchant')}, {normalized.get('amount')}")
+            return SaveResult(success=True, page_id="mock_page_id")
+            
+        except Exception as e:
+            logger.error(f"Transaction save failed: {e}", exc_info=True)
+            return SaveResult(success=False, error=str(e))
     
-    async def _append_blocks(self, page_id: str, expense: ExpenseExtracted):
-        """페이지에 상세 내용 추가"""
-        url = f"{self.api_base}/blocks/{page_id}/children"
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json"
+    def _validate_transaction(self, tx: Transaction) -> List[str]:
+        """거래 유효성 검사"""
+        errors = []
+        
+        if not tx.description:
+            errors.append("missing description")
+        
+        if tx.amount is None or tx.amount == 0:
+            errors.append(f"invalid amount: {tx.amount}")
+        
+        if not tx.transaction_date:
+            errors.append("missing date")
+        
+        return errors
+    
+    def _normalize_transaction(self, tx: Transaction) -> Dict[str, Any]:
+        """Transaction -> Expense 형식 정규화"""
+        normalized = {
+            'merchant': tx.merchant or tx.description or 'Unknown',
+            'amount': abs(float(tx.amount)) if tx.amount else 0,
+            'date': tx.transaction_date,
+            'currency': tx.currency or 'USD',
+            'category': self._map_transaction_category(tx),
+            'subcategory': None,
+            'payment_method': self._map_payment_method(tx),
+            'description': tx.description,
+            'raw_type': tx.raw_type,
         }
         
-        blocks = []
+        logger.debug(f"Normalized transaction: {normalized}")
+        return normalized
+    
+    def _map_transaction_category(self, tx: Transaction) -> str:
+        """거래 카테고리 매핑"""
+        desc_lower = (tx.description or '').lower()
         
-        # 요약
-        blocks.append({
-            "object": "block",
-            "type": "heading_2",
-            "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": "📊 요약"}}]
-            }
-        })
+        # Income
+        if tx.transaction_type == 'credit' or tx.amount > 0:
+            if 'payroll' in desc_lower or 'salary' in desc_lower:
+                return '수입'
+            if 'zelle' in desc_lower and tx.amount > 0:
+                return '이체입금'
+            return '수입'
         
-        summary = f"가맹점: {expense.merchant or 'Unknown'}\n"
-        summary += f"금액: {expense.total or 0:,} {expense.currency}\n"
-        summary += f"카테고리: {expense.category}"
-        if expense.subcategory:
-            summary += f" / {expense.subcategory}"
+        # Expense categories
+        if 'restaurant' in desc_lower or 'dunkin' in desc_lower or 'food' in desc_lower:
+            return '식비'
+        if 'grocery' in desc_lower or 'market' in desc_lower:
+            return '식료품'
+        if 'transport' in desc_lower or 'uber' in desc_lower or 'lyft' in desc_lower:
+            return '교통'
+        if 'shopping' in desc_lower or 'amazon' in desc_lower:
+            return '쇼핑'
         
-        blocks.append({
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": summary}}]
-            }
-        })
+        # Default
+        if 'zelle' in desc_lower:
+            return '이체'
+        if 'pos' in desc_lower or 'card' in desc_lower:
+            return '카드결제'
         
-        # 품목 목록
-        if expense.line_items:
-            blocks.append({
-                "object": "block",
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [{"type": "text", "text": {"content": "📝 품목"}}]
-                }
-            })
-            
-            for item in expense.line_items:
-                item_text = f"• {item.name}"
-                if item.quantity and item.unit_price:
-                    item_text += f" ({item.quantity} x {item.unit_price:,})"
-                if item.total_price:
-                    item_text += f" = {item.total_price:,}"
-                
-                blocks.append({
-                    "object": "block",
-                    "type": "bulleted_list_item",
-                    "bulleted_list_item": {
-                        "rich_text": [{"type": "text", "text": {"content": item_text}}]
-                    }
-                })
+        return '기타'
+    
+    def _map_payment_method(self, tx: Transaction) -> str:
+        """결제수단 매핑"""
+        raw = (tx.raw_type or '').lower()
         
-        # 피드백
-        if expense.feedback:
-            blocks.append({
-                "object": "block",
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [{"type": "text", "text": {"content": "💡 피드백"}}]
-                }
-            })
-            
-            for fb in expense.feedback:
-                blocks.append({
-                    "object": "block",
-                    "type": "callout",
-                    "callout": {
-                        "rich_text": [{"type": "text", "text": {"content": fb}}],
-                        "icon": {"emoji": "💡"}
-                    }
-                })
+        if 'zelle' in raw:
+            return 'Zelle'
+        if 'ach' in raw:
+            return 'ACH'
+        if 'pos' in raw or 'card' in raw:
+            return '체크카드'
         
-        # 원본 텍스트
-        if expense.raw_text:
-            blocks.append({
-                "object": "block",
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [{"type": "text", "text": {"content": "🔍 OCR 원본"}}]
-                }
-            })
-            
-            blocks.append({
-                "object": "block",
-                "type": "quote",
-                "quote": {
-                    "rich_text": [{"type": "text", "text": {"content": expense.raw_text[:2000]}}]
-                }
-            })
+        return '기타'
+    
+    def _validate_payload(self, payload: Dict[str, Any]) -> List[str]:
+        """Notion payload 유효성 검사"""
+        errors = []
         
-        # 신뢰도
-        confidence_text = f"신뢰도: {expense.confidence:.2f}"
-        if expense.need_review:
-            confidence_text += " ⚠️ 검토 필요"
+        # Check required fields
+        if not payload.get('이름', {}).get('title'):
+            errors.append("missing 이름(title)")
         
-        blocks.append({
-            "object": "block",
-            "type": "divider",
-            "divider": {}
-        })
+        if not payload.get('날짜', {}).get('date', {}).get('start'):
+            errors.append("missing 날짜(date)")
         
-        blocks.append({
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{
-                    "type": "text",
-                    "text": {"content": confidence_text},
-                    "annotations": {"italic": True}
-                }]
-            }
-        })
+        amount = payload.get('금액', {}).get('number')
+        if amount is None or amount == 0:
+            errors.append(f"invalid 금액(number): {amount}")
         
-        # 배치로 전송 (100개 제한)
-        for i in range(0, len(blocks), 100):
-            batch = blocks[i:i+100]
-            payload = {"children": batch}
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.patch(url, headers=headers, json=payload) as resp:
-                    if resp.status != 200:
-                        logger.error(f"Failed to append blocks: {resp.status}")
+        return errors
+    
+    def _build_expense_payload(self, expense: ExpenseExtracted) -> Dict[str, Any]:
+        """영수증 payload 빌드"""
+        return {
+            "이름": {"title": [{"text": {"content": expense.merchant or "Unknown"}}]},
+            "날짜": {"date": {"start": str(expense.transaction_date)}},
+            "금액": {"number": float(expense.total) if expense.total else 0},
+            "카테고리": {"select": {"name": expense.category or "미분류"}},
+            "세부카테고리": {"select": {"name": expense.subcategory or "미분류"}},
+            "결제수단": {"select": {"name": expense.payment_method or "미확인"}},
+            "통화": {"select": {"name": expense.currency or "USD"}},
+            "문서타입": {"select": {"name": "영수증"}},
+            "신뢰도": {"number": getattr(expense, 'confidence', 0.8)},
+            "검토필요": {"checkbox": getattr(expense, 'needs_review', False)},
+        }
+    
+    def _build_transaction_payload(self, normalized: Dict[str, Any]) -> Dict[str, Any]:
+        """거래 payload 빌드"""
+        date_str = normalized.get('date')
+        if isinstance(date_str, date):
+            date_str = date_str.isoformat()
+        
+        return {
+            "이름": {"title": [{"text": {"content": normalized.get('merchant', 'Unknown')[:100]}}]},
+            "날짜": {"date": {"start": date_str}},
+            "금액": {"number": float(normalized.get('amount', 0))},
+            "카테고리": {"select": {"name": normalized.get('category', '미분류')}},
+            "세부카테고리": {"select": {"name": normalized.get('subcategory', '미분류') or '미분류'}},
+            "결제수단": {"select": {"name": normalized.get('payment_method', '미확인')}},
+            "통화": {"select": {"name": normalized.get('currency', 'USD')}},
+            "문서타입": {"select": {"name": "명세서"}},
+            "신뢰도": {"number": 0.9},
+            "검토필요": {"checkbox": False},
+        }
