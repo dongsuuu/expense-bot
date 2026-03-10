@@ -1,152 +1,90 @@
 """
-Pydantic Models for Expense Analysis - Dual Mode Support
-Single Receipt + Bank Statement Transactions
+Pydantic Schemas
 """
 
-from datetime import date, datetime
-from typing import List, Optional, Literal
-from pydantic import BaseModel, Field, validator
-
-
-class LineItem(BaseModel):
-    """개별 품목 (영수증용)"""
-    name: str = Field(..., description="품목명")
-    quantity: Optional[float] = Field(None, description="수량")
-    unit_price: Optional[float] = Field(None, description="단가")
-    total_price: Optional[float] = Field(None, description="총액")
-
-
-class Transaction(BaseModel):
-    """은행 명세서 개별 거래"""
-    transaction_date: Optional[date] = Field(None, description="거래일")
-    description: str = Field(..., description="원본 설명")
-    merchant: Optional[str] = Field(None, description="정제된 가맹점명")
-    amount: float = Field(..., description="금액 (양수=지출, 음수=수입)")
-    currency: str = Field(default="USD", description="통화")
-    raw_type: Optional[str] = Field(None, description="원본 타입 (POS DEBIT, Zelle 등)")
-    transaction_type: Literal["debit", "credit", "transfer", "unknown"] = Field(
-        default="unknown", description="거래 유형"
-    )
-    category: Literal[
-        "Groceries", "Dining", "Transportation", "Housing", "Utilities",
-        "Shopping", "Health", "Education", "Subscription", "Travel",
-        "Income", "Transfer", "Other"
-    ] = Field(default="Other", description="카테고리")
-    subcategory: Optional[str] = Field(None, description="세부카테고리")
-    spending_pattern: Literal["fixed", "variable", "likely_fixed", "unknown"] = Field(
-        default="unknown", description="지출 패턴"
-    )
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="신뢰도")
-    need_review: bool = Field(default=False, description="검토필요여부")
-    raw_text: Optional[str] = Field(None, description="원본 텍스트")
-    statement_month: Optional[str] = Field(None, description="명세서 월 (YYYY-MM)")
-    source_file: Optional[str] = Field(None, description="원본 파일명")
-
-
-class StatementExtractionResult(BaseModel):
-    """명세서 추출 결과"""
-    transactions: List[Transaction] = Field(default_factory=list)
-    statement_month: Optional[str] = Field(None, description="명세서 월")
-    total_debits: float = Field(default=0.0, description="총 지출")
-    total_credits: float = Field(default=0.0, description="총 수입")
-    currency: str = Field(default="USD")
-    source_file: Optional[str] = Field(None)
-    confidence: float = Field(default=0.5)
-    need_review: bool = Field(default=False)
+from typing import Optional, List
+from datetime import date
+from pydantic import BaseModel, Field
 
 
 class ExpenseExtracted(BaseModel):
-    """단일 영수증 추출 결과 (기존 모델 유지)"""
-    document_type: Literal["receipt", "invoice", "screenshot", "statement", "unknown"] = Field(
-        default="unknown"
-    )
-    merchant: Optional[str] = Field(None)
-    transaction_date: Optional[date] = Field(None)
-    currency: str = Field(default="KRW")
-    subtotal: Optional[float] = Field(None)
-    tax: Optional[float] = Field(None)
-    tip: Optional[float] = Field(None)
-    total: Optional[float] = Field(None)
-    payment_method: Optional[str] = Field(None)
-    category: Literal[
-        "Groceries", "Dining", "Transportation", "Housing", "Utilities",
-        "Shopping", "Health", "Education", "Subscription", "Travel",
-        "Income", "Transfer", "Other"
-    ] = Field(default="Other")
-    subcategory: Optional[str] = Field(None)
-    line_items: List[LineItem] = Field(default_factory=list)
-    raw_text: Optional[str] = Field(None)
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    need_review: bool = Field(default=False)
-    feedback: List[str] = Field(default_factory=list)
+    """추출된 지출 정보"""
+    merchant: Optional[str] = None
+    total: Optional[float] = None
+    transaction_date: Optional[date] = None
+    currency: str = "USD"
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    payment_method: Optional[str] = None
+    confidence: float = 0.8
+    needs_review: bool = False
+    items: Optional[List[dict]] = None
+    tax: Optional[float] = None
+    tip: Optional[float] = None
+    raw_text: Optional[str] = None
 
 
-class TelegramWebhook(BaseModel):
-    """Telegram Webhook 페이로드"""
-    update_id: int
-    message: Optional[dict] = None
-    edited_message: Optional[dict] = None
+class Transaction(BaseModel):
+    """은행 거래 내역"""
+    transaction_date: Optional[date] = None
+    description: Optional[str] = None
+    merchant: Optional[str] = None
+    amount: Optional[float] = None  # Positive = expense, negative = income
+    currency: str = "USD"
+    transaction_type: Optional[str] = None  # 'debit' or 'credit'
+    raw_type: Optional[str] = None  # 'Zelle debit', 'Card', etc.
+    balance: Optional[float] = None
     
-    def get_chat_id(self) -> Optional[int]:
-        msg = self.message or self.edited_message
-        if msg:
-            return msg.get('chat', {}).get('id')
-        return None
-    
-    def get_file_id(self) -> Optional[str]:
-        msg = self.message or self.edited_message
-        if not msg:
-            return None
-        if 'photo' in msg:
-            photos = msg['photo']
-            return photos[-1]['file_id'] if photos else None
-        if 'document' in msg:
-            return msg['document']['file_id']
-        return None
-    
-    def get_document_filename(self) -> Optional[str]:
-        """문서 파일명 추출"""
-        msg = self.message or self.edited_message
-        if msg and 'document' in msg:
-            return msg['document'].get('file_name', '')
-        return None
-    
-    def get_caption(self) -> Optional[str]:
-        msg = self.message or self.edited_message
-        if msg:
-            return msg.get('caption')
-        return None
-    
-    def get_document_filename(self) -> Optional[str]:
-        """문서 파일명 추출"""
-        msg = self.message or self.edited_message
-        if msg and 'document' in msg:
-            return msg['document'].get('file_name', '')
-        return None
+    class Config:
+        arbitrary_types_allowed = True
 
 
-class DuplicateCheckResult(BaseModel):
-    """중복 검사 결과"""
-    is_duplicate: bool
-    similarity_score: float
-    existing_page_id: Optional[str] = None
-    message: str
+class Statement(BaseModel):
+    """명세서"""
+    statement_date: Optional[date] = None
+    account_type: Optional[str] = None
+    transactions: List[Transaction] = Field(default_factory=list)
+    opening_balance: Optional[float] = None
+    closing_balance: Optional[float] = None
 
 
-class NotionPageResult(BaseModel):
-    """Notion 페이지 생성 결과"""
+class SaveResult(BaseModel):
+    """저장 결과"""
     success: bool
     page_id: Optional[str] = None
-    url: Optional[str] = None
     error: Optional[str] = None
 
 
-class MonthlySummary(BaseModel):
-    """월별 요약"""
-    month: str  # YYYY-MM
-    total_spending: float
-    fixed_spending: float
-    variable_spending: float
-    transaction_count: int
-    category_summary: dict  # category -> total
-    currency: str = "USD"
+class TelegramWebhook(BaseModel):
+    """Telegram Webhook Payload"""
+    update_id: int
+    message: Optional[dict] = None
+    
+    def get_chat_id(self) -> Optional[int]:
+        if self.message and 'chat' in self.message:
+            return self.message['chat'].get('id')
+        return None
+    
+    def get_file_id(self) -> Optional[str]:
+        if not self.message:
+            return None
+        
+        # Photo
+        if 'photo' in self.message and self.message['photo']:
+            return self.message['photo'][-1].get('file_id')
+        
+        # Document
+        if 'document' in self.message:
+            return self.message['document'].get('file_id')
+        
+        return None
+    
+    def get_caption(self) -> Optional[str]:
+        if self.message:
+            return self.message.get('caption')
+        return None
+    
+    def get_document_filename(self) -> Optional[str]:
+        if self.message and 'document' in self.message:
+            return self.message['document'].get('file_name')
+        return None
