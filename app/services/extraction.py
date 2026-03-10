@@ -378,3 +378,16 @@ class ExpenseExtractionService:
         description = re.sub(r'\s+', ' ', description).strip()
         
         return description[:50] if description else None
+    
+    async def extract_statement(self, pdf_text: str, filename: str = "") -> List[Transaction]:
+        """
+        Statement 추출 - telegram.py 호환용 wrapper
+        """
+        logger.info(f"extract_statement called for: {filename}")
+        
+        # Chase 파서 사용
+        if 'chase' in pdf_text.lower() or 'zelle' in pdf_text.lower():
+            return self.parse_chase_statement(pdf_text)
+        
+        # 기본 파서 (향후 확장용)
+        return self.parse_chase_statement(pdf_text)
