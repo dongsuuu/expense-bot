@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     
     # Notion
     NOTION_TOKEN: str = Field(..., description="Notion integration token")
-    NOTION_DATABASE_ID: str = Field(..., description="Notion database ID")
+    NOTION_DATABASE_ID: Optional[str] = Field(default=None, description="Notion database ID (optional - auto-creates if not provided)")
+    NOTION_PARENT_PAGE_ID: Optional[str] = Field(default=None, description="Notion parent page ID for auto-created database")
     NOTION_API_BASE: str = "https://api.notion.com/v1"
     NOTION_VERSION: str = "2022-06-28"
     
@@ -34,9 +35,8 @@ class Settings(BaseSettings):
         """Check which services are properly configured"""
         return {
             "telegram": bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_BOT_TOKEN != "your_telegram_bot_token"),
-            "notion": bool(self.NOTION_TOKEN and self.NOTION_DATABASE_ID and 
-                          self.NOTION_TOKEN != "your_notion_token" and 
-                          self.NOTION_DATABASE_ID != "your_database_id"),
+            "notion": bool(self.NOTION_TOKEN and self.NOTION_TOKEN != "your_notion_token"),
+            "notion_parent": bool(self.NOTION_PARENT_PAGE_ID and self.NOTION_PARENT_PAGE_ID != "your_parent_page_id"),
             "openai": bool(self.OPENAI_API_KEY),
         }
 
