@@ -59,7 +59,7 @@ def is_valid_transaction(tx: Transaction) -> bool:
     return True
 
 
-@router.post("/webhook/telegram")
+@router.post("/telegram")  # Changed from "/webhook/telegram"
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     """Handle Telegram webhook"""
     try:
@@ -78,7 +78,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         
         if not file_id:
             sender = TelegramSender()
-            await sender.send_message(chat_id, "📎 파일을 보내주세요!")
+            await sender.send_message(chat_id, "📎 파일을 별내주세요!")
             return {"ok": True}
         
         downloader = TelegramFileDownloader()
