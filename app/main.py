@@ -1,63 +1,47 @@
 """
-Expense Analysis Bot - FastAPI Backend
-Telegram → OCR → Extraction → Notion
+FastAPI Main Application
 """
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
 import logging
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-from app.core.config import settings
 from app.routes import telegram
+from app.core.config import settings
 
-# 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# FastAPI 앱 생성
 app = FastAPI(
-    title="Expense Analysis Bot",
-    description="Telegram 기반 지출 분석 및 Notion 연동 시스템",
+    title="Expense Bot",
+    description="Telegram → Notion Expense Tracker",
     version="1.0.0"
 )
 
-# 라우터 등록
-app.include_router(telegram.router, prefix="/webhook", tags=["telegram"])
-
-
-@app.get("/")
-async def root():
-    """헬스체크"""
-    return {
-        "status": "ok",
-        "service": "expense-analysis-bot",
-        "version": "1.0.0"
-    }
+app.include_router(telegram.router, prefix="/webhook")
 
 
 @app.get("/health")
 async def health_check():
-    """상태 확인"""
+    """Health check endpoint"""
+    config_status = settings.is_configured()
     return {
         "status": "healthy",
-        "telegram_webhook": settings.TELEGRAM_WEBHOOK_URL is not None,
-        "notion_integration": settings.NOTION_TOKEN is not None
+        "configured": config_status,
+        "all_ready": config_status["telegram"] and config_status["notion"]
     }
 
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {"app": "Expense Bot", "version": "1.0.0", "docs": "/docs"}
+
+
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """전역 예외 처리"""
-    logger.error(f"Global error: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
-    )
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+async def global_exception_handler(request, exc):
+    """Global exception handler"""
+    logger.error(f"Global exception: {exc}", exc_info=True)
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
