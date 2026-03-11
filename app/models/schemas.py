@@ -1,14 +1,13 @@
 """
-Pydantic Schemas
+Pydantic Schemas - Unified and Clean
 """
-
-from typing import Optional, List
+from typing import Optional, List, Any
 from datetime import date
 from pydantic import BaseModel, Field
 
 
 class ExpenseExtracted(BaseModel):
-    """추출된 지출 정보"""
+    """Extracted expense from receipt"""
     merchant: Optional[str] = None
     total: Optional[float] = None
     transaction_date: Optional[date] = None
@@ -22,17 +21,18 @@ class ExpenseExtracted(BaseModel):
     tax: Optional[float] = None
     tip: Optional[float] = None
     raw_text: Optional[str] = None
+    feedback: Optional[str] = None
 
 
 class Transaction(BaseModel):
-    """은행 거래 내역"""
+    """Bank transaction from statement"""
     transaction_date: Optional[date] = None
     description: Optional[str] = None
     merchant: Optional[str] = None
-    amount: Optional[float] = None  # Positive = expense, negative = income
+    amount: Optional[float] = None
     currency: str = "USD"
-    transaction_type: Optional[str] = None  # 'debit' or 'credit'
-    raw_type: Optional[str] = None  # 'Zelle debit', 'Card', etc.
+    transaction_type: Optional[str] = None
+    raw_type: Optional[str] = None
     balance: Optional[float] = None
     
     class Config:
@@ -40,7 +40,7 @@ class Transaction(BaseModel):
 
 
 class Statement(BaseModel):
-    """명세서"""
+    """Parsed statement"""
     statement_date: Optional[date] = None
     account_type: Optional[str] = None
     transactions: List[Transaction] = Field(default_factory=list)
@@ -49,15 +49,15 @@ class Statement(BaseModel):
 
 
 class SaveResult(BaseModel):
-    """저장 결과"""
+    """Result of saving to Notion"""
     success: bool
     page_id: Optional[str] = None
     error: Optional[str] = None
 
 
 class DuplicateCheckResult(BaseModel):
-    """중복 검사 결과"""
-    is_duplicate: bool
+    """Result of duplicate check"""
+    is_duplicate: bool = False
     matched_id: Optional[str] = None
     confidence: float = 0.0
 
@@ -75,15 +75,10 @@ class TelegramWebhook(BaseModel):
     def get_file_id(self) -> Optional[str]:
         if not self.message:
             return None
-        
-        # Photo
         if 'photo' in self.message and self.message['photo']:
             return self.message['photo'][-1].get('file_id')
-        
-        # Document
         if 'document' in self.message:
             return self.message['document'].get('file_id')
-        
         return None
     
     def get_caption(self) -> Optional[str]:
