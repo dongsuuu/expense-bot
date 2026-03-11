@@ -1,11 +1,9 @@
 """
 Telegram File Downloader
 """
-
+import logging
 import os
 import aiohttp
-import logging
-from typing import Tuple, Optional
 
 from app.core.config import settings
 
@@ -13,85 +11,49 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramFileDownloader:
-    """Telegram 파일 다운로더"""
+    """Download files from Telegram"""
     
     def __init__(self):
-        self.api_base = settings.telegram_api_url
-        self.temp_dir = "/tmp/expense-bot"
-        os.makedirs(self.temp_dir, exist_ok=True)
+        self.token = settings.TELEGRAM_BOT_TOKEN
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
     
-    async def download(self, file_id: str) -> Tuple[str, str]:
-        """
-        파일 다운로드
+    async def download(self, file_id: str) -> tuple:
+        """Download file by file_id. Returns: (file_path, file_type)"""
+        file_info = await self._get_file_path(file_id)
+        if not file_info:
+            raise Exception(f"Could not get file path for {file_id}")
         
-        Returns:
-            (파일경로, 파일타입)
-        """
-        # 1. 파일 정보 가져오기
-        file_path = await self._get_file_path(file_id)
-        if not file_path:
-            raise ValueError(f"Cannot get file path for {file_id}")
+        file_path = file_info["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
         
-        # 2. 파일 다운로드
-        download_url = f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file_path}"
-        
-        local_path = os.path.join(self.temp_dir, os.path.basename(file_path))
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(download_url) as response:
-                if response.status != 200:
-                    raise ValueError(f"Download failed: {response.status}")
-                
-                with open(local_path, 'wb') as f:
-                    f.write(await response.read())
-        
-        # 3. 파일 타입 확인
-        file_type = self._detect_file_type(local_path)
-        
-        logger.info(f"Downloaded: {local_path} ({file_type})")
-        return local_path, file_type
-    
-    async def _get_file_path(self, file_id: str) -> Optional[str]:
-        """Telegram에서 파일 경로 가져오기"""
-        url = f"{self.api_base}/getFile"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json={"file_id": file_id}) as response:
-                if response.status != 200:
-                    return None
-                
-                data = await response.json()
-                if not data.get("ok"):
-                    return None
-                
-                return data["result"]["file_path"]
-    
-    def _detect_file_type(self, file_path: str) -> str:
-        """파일 타입 감지"""
         ext = os.path.splitext(file_path)[1].lower()
-        
-        if ext in ['.pdf']:
-            return "pdf"
-        elif ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
-            return "image"
+        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
+            file_type = 'image'
+        elif ext == '.pdf':
+            file_type = 'pdf'
         else:
-            # MIME 타입으로 확인
-            import mimetypes
-            mime, _ = mimetypes.guess_type(file_path)
-            
-            if mime:
-                if mime.startswith('image/'):
-                    return "image"
-                elif mime == 'application/pdf':
-                    return "pdf"
-            
-            return "unknown"
+            file_type = 'document'
+        
+        local_path = f"/tmp/{file_id}_{os.path.basename(file_path)}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url) as resp:
+                if resp.status == 200:
+                    with open(local_path, 'wb') as f:
+                        f.write(await resp.read())
+                    logger.info(f"Downloaded {file_type} to {local_path}")
+                    return local_path, file_type
+                else:
+                    raise Exception(f"Download failed: {resp.status}")
     
-    def cleanup(self, file_path: str):
-        """임시 파일 삭제"""
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logger.info(f"Cleaned up: {file_path}")
-        except Exception as e:
-            logger.warning(f"Cleanup failed: {e}")
+    async def _get_file_path(self, file_id: str) -> dict:
+        """Get file path from Telegram"""
+        url = f"{self.base_url}/getFile"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json={"file_id": file_id}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        return data["result"]
+                    raise Exception(f"Telegram error: {data}")
+                raise Exception(f"HTTP error: {resp.status}")
