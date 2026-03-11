@@ -1,11 +1,11 @@
 """
-Telegram Webhook Handler - Production Ready
+Telegram Webhook Handler - Production Ready with Auto-Create Database
 """
 import logging
 from typing import Optional, List
 from fastapi import APIRouter, Request, BackgroundTasks
 
-from app.models.schemas import TelegramWebhook, ExpenseExtracted, Transaction
+from app.models.schemas import TelegramWebhook, ExpenseExtracted, Transaction, SaveResult
 from app.services.extraction import ExpenseExtractionService
 from app.services.categorizer import Categorizer
 from app.services.deduper import DuplicateChecker
@@ -59,7 +59,7 @@ def is_valid_transaction(tx: Transaction) -> bool:
     return True
 
 
-@router.post("/telegram")  # Changed from "/webhook/telegram"
+@router.post("/telegram")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     """Handle Telegram webhook"""
     try:
@@ -152,7 +152,15 @@ async def process_receipt(chat_id: int, pdf_text: Optional[str], images: List[st
         categorizer = Categorizer()
         expense = categorizer.categorize(expense)
         
+        # Create shared NotionWriter instance
+        notion = NotionWriter()
         deduper = DuplicateChecker()
+        
+        # Share database ID with deduper (for auto-create mode)
+        db_id = await notion._ensure_database()
+        if db_id:
+            deduper.set_database_id(db_id)
+        
         dup_result = await deduper.check_expense(expense)
         
         if dup_result.is_duplicate:
@@ -161,8 +169,34 @@ async def process_receipt(chat_id: int, pdf_text: Optional[str], images: List[st
         
         await sender.send_message(chat_id, "💾 Notion에 저장하는 중...")
         
-        notion = NotionWriter()
         result = await notion.save_expense(expense)
+        
+        # Handle database creation/access errors
+        if result.error == "PARENT_PAGE_INVALID":
+            logger.error("Notion parent page is invalid or not accessible")
+            await sender.send_message(
+                chat_id,
+                "❌ Notion 데이터베이스를 생성할 수 없습니다.\n\n"
+                "부모 페이지 ID가 잘못되었거나,\n"
+                "integration과 페이지가 공유되지 않았습니다.\n\n"
+                "확인 방법:\n"
+                "1. NOTION_PARENT_PAGE_ID 확인\n"
+                "2. Integration에 페이지 공유 설정"
+            )
+            return
+        
+        if result.error == "DATABASE_INACCESSIBLE":
+            logger.error("Notion database is not accessible")
+            await sender.send_message(
+                chat_id,
+                "❌ Notion 데이터베이스에 접근할 수 없습니다.\n\n"
+                "데이터베이스 ID가 잘못되었거나,\n"
+                "integration과 데이터베이스가 공유되지 않았습니다.\n\n"
+                "확인 방법:\n"
+                "1. NOTION_DATABASE_ID 확인 (또는 비워두면 자동 생성)\n"
+                "2. Integration에 데이터베이스 공유 설정"
+            )
+            return
         
         if result.success:
             await sender.send_message(
@@ -212,14 +246,26 @@ async def process_statement(chat_id: int, pdf_text: Optional[str], images: List[
         
         await sender.send_message(chat_id, f"💾 {len(valid_txs)}개 거래 처리 중...")
         
+        # Create shared NotionWriter instance
         notion = NotionWriter()
         deduper = DuplicateChecker()
+        
+        # Share database ID with deduper (for auto-create mode)
+        db_id = await notion._ensure_database()
+        if db_id:
+            deduper.set_database_id(db_id)
         
         saved = 0
         failed = 0
         duplicates = 0
+        database_error = False
+        error_message = None
         
-        for tx in valid_txs:
+        for i, tx in enumerate(valid_txs):
+            if database_error:
+                logger.info(f"Skipping remaining {len(valid_txs) - i} transactions due to database error")
+                break
+            
             try:
                 dup_result = await deduper.check_transaction(tx)
                 if dup_result.is_duplicate:
@@ -227,20 +273,76 @@ async def process_statement(chat_id: int, pdf_text: Optional[str], images: List[
                     continue
                 
                 result = await notion.save_transaction(tx)
+                
+                # Check for database configuration errors
+                if result.error == "PARENT_PAGE_INVALID":
+                    database_error = True
+                    error_message = "parent_page"
+                    logger.error(f"Notion parent page invalid on transaction {i+1}, stopping batch")
+                    break
+                
+                if result.error == "DATABASE_INACCESSIBLE":
+                    database_error = True
+                    error_message = "database"
+                    logger.error(f"Notion database not accessible on transaction {i+1}, stopping batch")
+                    break
+                
                 if result.success:
                     saved += 1
                 else:
                     failed += 1
                     logger.warning(f"Save failed: {result.error}")
+                    
             except Exception as e:
                 failed += 1
                 logger.error(f"Transaction processing error: {e}")
         
-        msg = f"✅ 처리 완료\n\n📊 총 거래: {len(valid_txs)}개\n💾 저장 성공: {saved}개\n"
-        if duplicates > 0:
-            msg += f"⚠️ 중복 제외: {duplicates}개\n"
-        if failed > 0:
-            msg += f"❌ 저장 실패: {failed}개"
+        # Build result message
+        if database_error:
+            if error_message == "parent_page":
+                msg = (
+                    f"❌ Notion 데이터베이스 생성 실패\n\n"
+                    f"📊 총 거래: {len(valid_txs)}개\n"
+                    f"💾 저장 성공: {saved}개\n"
+                )
+                if duplicates > 0:
+                    msg += f"⚠️ 중복 제외: {duplicates}개\n"
+                if failed > 0:
+                    msg += f"❌ 저장 실패: {failed}개\n"
+                msg += (
+                    f"\n⛔️ 부모 페이지 ID가 잘못되었거나\n"
+                    f"integration과 공유되지 않았습니다.\n\n"
+                    f"확인 방법:\n"
+                    f"1. NOTION_PARENT_PAGE_ID 확인\n"
+                    f"2. Integration에 페이지 공유 설정"
+                )
+            else:
+                msg = (
+                    f"❌ Notion 데이터베이스 오류\n\n"
+                    f"📊 총 거래: {len(valid_txs)}개\n"
+                    f"💾 저장 성공: {saved}개\n"
+                )
+                if duplicates > 0:
+                    msg += f"⚠️ 중복 제외: {duplicates}개\n"
+                if failed > 0:
+                    msg += f"❌ 저장 실패: {failed}개\n"
+                msg += (
+                    f"\n⛔️ 데이터베이스 ID가 잘못되었거나\n"
+                    f"integration과 공유되지 않았습니다.\n\n"
+                    f"확인 방법:\n"
+                    f"1. NOTION_DATABASE_ID 확인 (또는 비워두면 자동 생성)\n"
+                    f"2. Integration에 데이터베이스 공유 설정"
+                )
+        else:
+            msg = (
+                f"✅ 처리 완료\n\n"
+                f"📊 총 거래: {len(valid_txs)}개\n"
+                f"💾 저장 성공: {saved}개\n"
+            )
+            if duplicates > 0:
+                msg += f"⚠️ 중복 제외: {duplicates}개\n"
+            if failed > 0:
+                msg += f"❌ 저장 실패: {failed}개"
         
         await sender.send_message(chat_id, msg)
         
