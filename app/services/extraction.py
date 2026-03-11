@@ -1,11 +1,10 @@
 """
-Expense Extraction Service - Robust Chase Statement Parser
+Expense Extraction Service - Robust Implementation
 """
-
 import logging
 import re
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from app.models.schemas import ExpenseExtracted, Transaction
 
@@ -13,9 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 class ExpenseExtractionService:
-    """지출 추출 - Robust Chase 지원"""
+    """Extract expenses from receipts and statements"""
     
-    # Month name mapping
     MONTH_MAP = {
         'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
         'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
@@ -25,30 +23,22 @@ class ExpenseExtractionService:
         'september': 9, 'october': 10, 'november': 11, 'december': 12
     }
     
-    # Transaction type patterns
-    TX_TYPES = [
-        'Zelle debit', 'Zelle credit', 'Zelle payment',
-        'ACH debit', 'ACH credit',
-        'POS DEBIT', 'POS debit',
-        'Card', 'Debit Card', 'Credit Card'
-    ]
-    
-    async def extract_receipt(
-        self,
-        images: List[str],
-        raw_text: Optional[str] = None,
-        caption: Optional[str] = None
-    ) -> ExpenseExtracted:
-        """영수증 추출"""
+    async def extract_receipt(self, images: List[str], raw_text: Optional[str] = None, 
+                              caption: Optional[str] = None) -> ExpenseExtracted:
+        """Extract expense from receipt images/text"""
         expense = ExpenseExtracted()
         
         if raw_text:
             expense = self._parse_receipt_text(raw_text)
         
+        if caption:
+            if not expense.merchant:
+                expense.merchant = caption.strip()[:50]
+        
         return expense
     
     def _parse_receipt_text(self, text: str) -> ExpenseExtracted:
-        """영수증 텍스트 파싱"""
+        """Parse receipt text"""
         expense = ExpenseExtracted()
         
         amounts = re.findall(r'\$?([\d,]+\.\d{2})', text)
@@ -56,338 +46,201 @@ class ExpenseExtractionService:
             try:
                 parsed = [float(a.replace(',', '')) for a in amounts]
                 expense.total = max(parsed)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Amount parsing failed: {e}")
         
-        date_match = re.search(r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})', text)
-        if date_match:
-            try:
-                expense.transaction_date = datetime(
-                    int(date_match.group(1)),
-                    int(date_match.group(2)),
-                    int(date_match.group(3))
-                ).date()
-            except:
-                pass
+        date_patterns = [
+            r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})',
+            r'(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})',
+        ]
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    if len(match.group(1)) == 4:
+                        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    else:
+                        month, day, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    expense.transaction_date = datetime(year, month, day).date()
+                    break
+                except Exception as e:
+                    logger.warning(f"Date parsing failed: {e}")
         
         lines = [l.strip() for l in text.split('\n') if l.strip()]
         if lines:
-            expense.merchant = lines[0][:50]
+            for line in lines[:5]:
+                skip_words = ['receipt', 'invoice', 'order', 'date', 'total']
+                if not any(sw in line.lower() for sw in skip_words):
+                    expense.merchant = line[:50]
+                    break
+            if not expense.merchant:
+                expense.merchant = lines[0][:50]
         
         return expense
     
+    async def extract_statement(self, pdf_text: str, filename: str = "") -> List[Transaction]:
+        """Extract transactions from statement"""
+        logger.info(f"Extracting statement: {len(pdf_text)} chars, filename={filename}")
+        
+        if 'chase' in pdf_text.lower() or 'zelle' in pdf_text.lower():
+            return self.parse_chase_statement(pdf_text)
+        
+        return self.parse_chase_statement(pdf_text)
+    
     def parse_chase_statement(self, text: str) -> List[Transaction]:
-        """
-        Chase statement 파싱 - Robust implementation
-        """
-        logger.info(f"Starting Chase parser: {len(text)} chars input")
+        """Parse Chase statement - robust multiline parser"""
+        logger.info(f"Parsing Chase statement: {len(text)} chars")
         
-        # 1. Normalize text
-        normalized = self._normalize_text(text)
-        logger.debug(f"Normalized text: {len(normalized)} chars")
+        text = text.replace('−', '-').replace('—', '-').replace('–', '-')
         
-        # 2. Split and preprocess lines
-        raw_lines = normalized.split('\n')
-        lines = self._preprocess_lines(raw_lines)
-        logger.info(f"After preprocessing: {len(lines)} lines")
-        
-        if not lines:
-            logger.warning("No valid lines after preprocessing")
-            return []
-        
-        # 3. Stateful parsing
-        transactions = self._stateful_parse(lines)
-        
-        logger.info(f"Parsing complete: {len(transactions)} transactions extracted")
-        return transactions
-    
-    def _normalize_text(self, text: str) -> str:
-        """텍스트 정규화"""
-        # Unicode minus → ASCII minus
-        text = text.replace('−', '-')
-        text = text.replace('—', '-')
-        text = text.replace('–', '-')
-        
-        # Collapse whitespace but preserve newlines
         lines = text.split('\n')
-        normalized_lines = []
-        for line in lines:
-            # Replace multiple spaces with single space
-            line = ' '.join(line.split())
-            normalized_lines.append(line)
-        
-        return '\n'.join(normalized_lines)
-    
-    def _preprocess_lines(self, raw_lines: List[str]) -> List[str]:
-        """라인 전처리 - 헤더/푸터 제거"""
-        processed = []
-        in_pending_section = False
-        
-        for line in raw_lines:
-            line = line.strip()
-            
-            # Skip empty lines
-            if not line:
-                continue
-            
-            # Detect Pending section
-            if line.lower() == 'pending':
-                logger.debug("Pending section detected, skipping")
-                in_pending_section = True
-                continue
-            
-            # Skip pending items
-            if in_pending_section:
-                # Check if we're out of pending (new date or section)
-                if re.match(r'^(\w{3})\s+\d{1,2},?\s+\d{4}$', line):
-                    in_pending_section = False
-                else:
-                    logger.debug(f"Skipping pending line: {line[:50]}")
-                    continue
-            
-            # Skip noise lines
-            if self._is_noise_line(line):
-                logger.debug(f"Skipping noise: {line[:50]}")
-                continue
-            
-            processed.append(line)
-        
-        return processed
-    
-    def _is_noise_line(self, line: str) -> bool:
-        """노이즈 라인 필터링"""
-        line_lower = line.lower()
-        
-        # Exact matches
-        noise_exact = [
-            'printed from chase personal online',
-            'total checking',
-            'transactions',
-            'showing all transactions',
-            'date description type amount balance',
-            'deposits and additions',
-            'withdrawals',
-            'opening balance',
-            'closing balance',
-        ]
-        
-        for noise in noise_exact:
-            if line_lower == noise:
-                return True
-        
-        # Pattern matches
-        noise_patterns = [
-            r'^chase\.com',
-            r'^https://secure\.chase\.com',
-            r'^\d+/\d+$',  # page markers like 1/13
-            r'^\d+/\d+/\d+\s+\d+:\d+',  # timestamps
-            r'^\d{1,2}\.\s*\d{1,2}\.',  # localized dates
-            r'^[\d\s]+오전',  # Korean timestamps
-            r'^[\d\s]+오후',  # Korean timestamps
-        ]
-        
-        for pattern in noise_patterns:
-            if re.match(pattern, line_lower):
-                return True
-        
-        return False
-    
-    def _stateful_parse(self, lines: List[str]) -> List[Transaction]:
-        """Stateful 파싱 - date 유지, multiline 지원"""
         transactions = []
         
         current_date = None
-        description_buffer = []
+        description_lines = []
         
-        logger.debug(f"Starting stateful parse of {len(lines)} lines")
-        
-        for i, line in enumerate(lines):
-            logger.debug(f"Line {i}: {line[:80]}")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
             
-            # Try to detect date
-            date_result = self._try_parse_date(line)
+            if self._is_chase_noise(line):
+                continue
             
-            if date_result:
-                # New date found - save previous transaction if exists
-                if current_date and description_buffer:
-                    tx = self._try_build_transaction(
-                        current_date, description_buffer
-                    )
-                    if tx:
+            date_match = re.match(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2}),?\s+(\d{4})(.*)$', 
+                                  line, re.IGNORECASE)
+            
+            if date_match:
+                if current_date and description_lines:
+                    tx = self._build_transaction(current_date, description_lines)
+                    if tx and tx.amount != 0:
                         transactions.append(tx)
-                        logger.debug(f"Transaction built: {tx.description[:50]}")
-                    description_buffer = []
+                    description_lines = []
                 
-                # Start new date context
-                current_date = date_result['date']
-                remaining = date_result['remaining']
-                
-                logger.debug(f"New date: {current_date}, remaining: {remaining[:50] if remaining else 'None'}")
-                
-                if remaining:
-                    description_buffer.append(remaining)
+                try:
+                    month_str = date_match.group(1).lower()[:3]
+                    month = self.MONTH_MAP.get(month_str, 1)
+                    day = int(date_match.group(2))
+                    year = int(date_match.group(3))
+                    current_date = datetime(year, month, day).date()
+                    
+                    remaining = date_match.group(4).strip()
+                    if remaining:
+                        description_lines.append(remaining)
+                        
+                except Exception as e:
+                    logger.warning(f"Date parse error: {e}")
             
             elif current_date:
-                # No date - accumulate to description or try complete transaction
-                # Check if this line completes a transaction
-                tx = self._try_build_transaction(current_date, description_buffer + [line])
-                
+                tx = self._try_complete_transaction(current_date, description_lines + [line])
                 if tx:
-                    # This line completed a transaction
                     transactions.append(tx)
-                    logger.debug(f"Transaction completed with line: {tx.description[:50]}")
-                    description_buffer = []
+                    description_lines = []
                 else:
-                    # Just accumulate
-                    description_buffer.append(line)
+                    description_lines.append(line)
         
-        # Don't forget last transaction
-        if current_date and description_buffer:
-            tx = self._try_build_transaction(current_date, description_buffer)
-            if tx:
+        if current_date and description_lines:
+            tx = self._build_transaction(current_date, description_lines)
+            if tx and tx.amount != 0:
                 transactions.append(tx)
-                logger.debug(f"Final transaction built: {tx.description[:50]}")
         
+        logger.info(f"Parsed {len(transactions)} transactions")
         return transactions
     
-    def _try_parse_date(self, line: str) -> Optional[dict]:
-        """날짜 파싱 시도"""
-        # Pattern: "Mar 6, 2026" or "Mar 6 2026"
-        match = re.match(r'^(\w{3})\s+(\d{1,2}),?\s+(\d{4})(.*)$', line)
+    def _is_chase_noise(self, line: str) -> bool:
+        """Check if line is Chase header/footer noise"""
+        noise_patterns = [
+            r'^printed from chase',
+            r'^total checking',
+            r'^chase\.com',
+            r'^https://',
+            r'^date\s+description',
+            r'^page\s+\d+\s+of\s+\d+',
+            r'^opening balance',
+            r'^closing balance',
+            r'^pending$',
+            r'^transactions showing',
+        ]
         
-        if not match:
-            return None
-        
-        month_str = match.group(1).lower()
-        day = match.group(2)
-        year = match.group(3)
-        remaining = match.group(4).strip()
-        
-        month = self.MONTH_MAP.get(month_str)
-        if not month:
-            return None
-        
-        try:
-            date = datetime(int(year), month, int(day)).date()
-            return {
-                'date': date,
-                'remaining': remaining
-            }
-        except ValueError as e:
-            logger.warning(f"Invalid date: {year}-{month}-{day}: {e}")
-            return None
+        line_lower = line.lower()
+        for pattern in noise_patterns:
+            if re.match(pattern, line_lower):
+                return True
+        return False
     
-    def _try_build_transaction(
-        self,
-        date: datetime.date,
-        description_lines: List[str]
-    ) -> Optional[Transaction]:
-        """트랜잭션 빌드 시도"""
-        if not description_lines:
-            return None
+    def _try_complete_transaction(self, date: datetime.date, lines: List[str]) -> Optional[Transaction]:
+        """Try to build complete transaction from lines"""
+        full_text = ' '.join(lines)
         
-        # Join description lines
-        full_text = ' '.join(description_lines)
-        logger.debug(f"Trying to build transaction from: {full_text[:100]}")
-        
-        # Look for amount pattern: -$10.00 or $10.00 or just 10.00
-        # Must have balance indicator (second amount)
-        amount_pattern = r'(-?\$?([\d,]+\.\d{2}))\s+(-?\$?([\d,]+\.\d{2}))'
-        amount_match = re.search(amount_pattern, full_text)
+        amount_match = re.search(r'(-?\$?[\d,]+\.\d{2})\s+(-?\$?[\d,]+\.\d{2})\s*$', full_text)
         
         if not amount_match:
-            logger.debug("No amount/balance pattern found")
             return None
         
         try:
-            # Parse amounts
             amount_str = amount_match.group(1).replace(',', '').replace('$', '')
-            balance_str = amount_match.group(3).replace(',', '').replace('$', '')
+            balance_str = amount_match.group(2).replace(',', '').replace('$', '')
             
             amount = float(amount_str)
             balance = float(balance_str)
             
-            # Determine if expense (negative) or income (positive)
-            # In Chase statements, debits are shown as negative or with minus sign
-            is_expense = amount < 0 or '-$' in amount_match.group(0)
+            text_upper = full_text.upper()
+            raw_type = None
+            is_debit = False
             
-            # Extract description (everything before amount)
+            if 'ZELLE' in text_upper:
+                raw_type = 'Zelle'
+                is_debit = amount < 0 or 'DEBIT' in text_upper or 'payment to' in full_text.lower()
+            elif 'POS' in text_upper or 'CARD' in text_upper:
+                raw_type = 'Card'
+                is_debit = True
+            elif 'ACH' in text_upper:
+                raw_type = 'ACH'
+                is_debit = amount < 0
+            
             desc_end = amount_match.start()
             description = full_text[:desc_end].strip()
+            description = re.sub(r'\s+', ' ', description)
             
-            # Extract transaction type
-            tx_type = self._extract_transaction_type(full_text)
+            merchant = self._extract_merchant(description, raw_type)
             
-            # Clean description
-            description = self._clean_description(description, tx_type)
-            
-            # Build transaction
-            transaction = Transaction(
+            return Transaction(
                 transaction_date=date,
-                description=description,
-                merchant=self._extract_merchant(description),
-                amount=abs(amount),  # Store positive for expense
+                description=description[:200],
+                merchant=merchant,
+                amount=abs(amount),
                 currency='USD',
-                raw_type=tx_type,
-                transaction_type='debit' if is_expense else 'credit'
+                transaction_type='debit' if is_debit else 'credit',
+                raw_type=raw_type,
+                balance=balance
             )
             
-            logger.debug(f"Built transaction: {description[:50]}, amount={amount}, type={tx_type}")
-            return transaction
-            
         except Exception as e:
-            logger.warning(f"Failed to build transaction: {e}")
+            logger.warning(f"Transaction build failed: {e}")
             return None
     
-    def _extract_transaction_type(self, text: str) -> Optional[str]:
-        """트랜잭션 타입 추출"""
-        text_upper = text.upper()
-        
-        for tx_type in self.TX_TYPES:
-            if tx_type.upper() in text_upper:
-                return tx_type
-        
-        return None
+    def _build_transaction(self, date: datetime.date, lines: List[str]) -> Optional[Transaction]:
+        """Build transaction from accumulated lines"""
+        return self._try_complete_transaction(date, lines)
     
-    def _clean_description(self, description: str, tx_type: Optional[str]) -> str:
-        """설명 정제"""
-        # Remove transaction type from description
-        if tx_type:
-            description = re.sub(r'\s*' + re.escape(tx_type) + r'\s*', ' ', description, flags=re.IGNORECASE)
-        
-        # Clean up
-        description = re.sub(r'\s+', ' ', description).strip()
-        
-        return description
-    
-    def _extract_merchant(self, description: str) -> Optional[str]:
-        """가맹점 추출"""
+    def _extract_merchant(self, description: str, raw_type: Optional[str]) -> Optional[str]:
+        """Extract merchant name from description"""
         if not description:
             return None
         
-        # Remove common prefixes
-        prefixes = ['POS DEBIT', 'Zelle payment to', 'Zelle to', 'ACH', 'WIRE']
+        prefixes = [
+            'POS DEBIT', 'POS', 'ZELLE PAYMENT TO', 'ZELLE TO', 
+            'ZELLE FROM', 'ACH DEBIT', 'ACH CREDIT', 'ACH'
+        ]
+        
+        desc_upper = description.upper()
         for prefix in prefixes:
-            if description.upper().startswith(prefix):
+            if desc_upper.startswith(prefix):
                 description = description[len(prefix):].strip()
+                break
         
-        # Remove long numbers (IDs, phone numbers)
-        description = re.sub(r'\b\d{7,}\b', '', description)
-        
-        # Clean up
+        description = re.sub(r'\b\d{6,}\b', '', description)
+        description = re.sub(r'\b\d{3}-\d{3}-\d{4}\b', '', description)
         description = re.sub(r'\s+', ' ', description).strip()
         
         return description[:50] if description else None
-    
-    async def extract_statement(self, pdf_text: str, filename: str = "") -> List[Transaction]:
-        """
-        Statement 추출 - telegram.py 호환용 wrapper
-        """
-        logger.info(f"extract_statement called for: {filename}")
-        
-        # Chase 파서 사용
-        if 'chase' in pdf_text.lower() or 'zelle' in pdf_text.lower():
-            return self.parse_chase_statement(pdf_text)
-        
-        # 기본 파서 (향후 확장용)
-        return self.parse_chase_statement(pdf_text)
