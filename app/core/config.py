@@ -1,47 +1,44 @@
 """
-Configuration Settings
+Configuration - Pydantic Settings
 """
-
 import os
 from typing import Optional
 from pydantic_settings import BaseSettings
+from pydantic import Field
 
 
 class Settings(BaseSettings):
-    """환경 변수 설정"""
+    """Application settings"""
     
     # Telegram
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_WEBHOOK_URL: Optional[str] = os.getenv("TELEGRAM_WEBHOOK_URL")
-    TELEGRAM_API_BASE: str = "https://api.telegram.org/bot"
+    TELEGRAM_BOT_TOKEN: str = Field(..., description="Telegram bot token")
     
     # Notion
-    NOTION_TOKEN: str = os.getenv("NOTION_TOKEN", "")
-    NOTION_DATABASE_ID: str = os.getenv("NOTION_DATABASE_ID", "")
+    NOTION_TOKEN: str = Field(..., description="Notion integration token")
+    NOTION_DATABASE_ID: str = Field(..., description="Notion database ID")
     NOTION_API_BASE: str = "https://api.notion.com/v1"
+    NOTION_VERSION: str = "2022-06-28"
     
-    # OpenAI (OCR/Extraction용)
-    OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+    # Render
+    RENDER_EXTERNAL_URL: Optional[str] = None
     
-    # Tesseract (로컬 OCR)
-    TESSERACT_CMD: str = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
-    
-    # App
-    DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    
-    # Duplicate Detection
-    DUPLICATE_THRESHOLD: float = 0.85  # 유사도 임계값
-    
-    @property
-    def telegram_api_url(self) -> str:
-        """Telegram API URL"""
-        return f"{self.TELEGRAM_API_BASE}{self.TELEGRAM_BOT_TOKEN}"
+    # Optional
+    OPENAI_API_KEY: Optional[str] = None
+    DUPLICATE_THRESHOLD: float = 0.85
     
     class Config:
         env_file = ".env"
-        case_sensitive = True
+        env_file_encoding = "utf-8"
+    
+    def is_configured(self) -> dict:
+        """Check which services are properly configured"""
+        return {
+            "telegram": bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_BOT_TOKEN != "your_telegram_bot_token"),
+            "notion": bool(self.NOTION_TOKEN and self.NOTION_DATABASE_ID and 
+                          self.NOTION_TOKEN != "your_notion_token" and 
+                          self.NOTION_DATABASE_ID != "your_database_id"),
+            "openai": bool(self.OPENAI_API_KEY),
+        }
 
 
-# 전역 설정 인스턴스
 settings = Settings()
