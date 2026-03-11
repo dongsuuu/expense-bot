@@ -1,5 +1,5 @@
 """
-Duplicate Detection Service - Real Notion Query
+Duplicate Detection Service - Real Notion Query with Auto-Create Support
 """
 import logging
 import re
@@ -17,7 +17,6 @@ class DuplicateChecker:
     
     def __init__(self):
         self.token = settings.NOTION_TOKEN
-        self.database_id = settings.NOTION_DATABASE_ID
         self.base_url = settings.NOTION_API_BASE
         self.version = settings.NOTION_VERSION
         self.headers = {
@@ -25,6 +24,12 @@ class DuplicateChecker:
             "Notion-Version": self.version,
             "Content-Type": "application/json"
         }
+        # Will be set from outside if using shared NotionWriter
+        self._database_id = settings.NOTION_DATABASE_ID
+    
+    def set_database_id(self, db_id: str):
+        """Set database ID (for auto-create mode)"""
+        self._database_id = db_id
     
     async def check(self, item: Any) -> DuplicateCheckResult:
         """Check if item is duplicate"""
@@ -93,10 +98,16 @@ class DuplicateChecker:
     
     async def _query_recent(self, limit: int = 100) -> list:
         """Query recent entries from Notion"""
-        if not self.token or not self.database_id:
+        if not self.token:
             return []
         
-        url = f"{self.base_url}/databases/{self.database_id}/query"
+        # Use database_id if set, otherwise can't query
+        db_id = self._database_id
+        if not db_id:
+            logger.debug("No database ID available for querying")
+            return []
+        
+        url = f"{self.base_url}/databases/{db_id}/query"
         payload = {
             "page_size": limit,
             "sorts": [{"timestamp": "created_time", "direction": "descending"}]
