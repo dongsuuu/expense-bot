@@ -1,5 +1,5 @@
 """
-Duplicate Detection Service - Real Notion Query with Auto-Create Support
+Duplicate Detection Service - Uses NotionWriter for database access
 """
 import logging
 import re
@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 class DuplicateChecker:
-    """Check for duplicates against Notion database"""
+    """Check for duplicates using shared NotionWriter"""
     
-    def __init__(self):
+    def __init__(self, notion_writer=None):
         self.token = settings.NOTION_TOKEN
         self.base_url = settings.NOTION_API_BASE
         self.version = settings.NOTION_VERSION
@@ -24,12 +24,23 @@ class DuplicateChecker:
             "Notion-Version": self.version,
             "Content-Type": "application/json"
         }
-        # Will be set from outside if using shared NotionWriter
-        self._database_id = settings.NOTION_DATABASE_ID
+        
+        # Use shared NotionWriter - do NOT read settings directly
+        self._notion_writer = notion_writer
+        self._database_id: Optional[str] = None  # Will be set from outside
+        
+        if notion_writer:
+            logger.info("DuplicateChecker initialized with NotionWriter")
+        else:
+            logger.warning("DuplicateChecker initialized without NotionWriter")
     
-    def set_database_id(self, db_id: str):
-        """Set database ID (for auto-create mode)"""
-        self._database_id = db_id
+    def set_database_id(self, db_id: Optional[str]):
+        """Set database ID from route/NotionWriter"""
+        self._database_id = db_id.strip() if db_id else None
+        if self._database_id:
+            logger.info(f"DuplicateChecker using database: {self._database_id[:20]}...")
+        else:
+            logger.warning("DuplicateChecker database ID set to None")
     
     async def check(self, item: Any) -> DuplicateCheckResult:
         """Check if item is duplicate"""
@@ -51,6 +62,16 @@ class DuplicateChecker:
                 logger.debug("Skip duplicate check: missing fields")
                 return DuplicateCheckResult(is_duplicate=False, confidence=0.0)
             
+            # Use database ID from NotionWriter if available
+            if self._notion_writer:
+                db_id = await self._notion_writer._ensure_database()
+            else:
+                db_id = self._database_id
+            
+            if not db_id:
+                logger.debug("No database available for duplicate check")
+                return DuplicateCheckResult(is_duplicate=False, confidence=0.0)
+            
             norm_merchant = self._normalize_text(merchant)
             norm_amount = round(float(amount), 2)
             date_str = date.isoformat() if date else None
@@ -58,7 +79,7 @@ class DuplicateChecker:
             if not date_str:
                 return DuplicateCheckResult(is_duplicate=False, confidence=0.0)
             
-            recent = await self._query_recent()
+            recent = await self._query_recent(db_id)
             
             for entry in recent:
                 entry_props = entry.get("properties", {})
@@ -96,15 +117,9 @@ class DuplicateChecker:
         """Check transaction for duplicates"""
         return await self.check(tx)
     
-    async def _query_recent(self, limit: int = 100) -> list:
+    async def _query_recent(self, db_id: str, limit: int = 100) -> list:
         """Query recent entries from Notion"""
-        if not self.token:
-            return []
-        
-        # Use database_id if set, otherwise can't query
-        db_id = self._database_id
-        if not db_id:
-            logger.debug("No database ID available for querying")
+        if not self.token or not db_id:
             return []
         
         url = f"{self.base_url}/databases/{db_id}/query"
@@ -120,8 +135,7 @@ class DuplicateChecker:
                         data = await resp.json()
                         return data.get("results", [])
                     else:
-                        body = await resp.text()
-                        logger.error(f"Query error: {resp.status} - {body}")
+                        logger.error(f"Query error: {resp.status}")
                         return []
         except Exception as e:
             logger.error(f"Failed to query: {e}")
