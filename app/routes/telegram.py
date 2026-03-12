@@ -309,38 +309,6 @@ async def process_statement(chat_id: int, pdf_text: Optional[str], images: List[
             msg += f"⚠️ 중복 제외: {duplicates}개\n"
         if failed > 0:
             msg += f"❌ 저장 실패: {failed}개"
-                    f"integration과 공유되지 않았습니다.\n\n"
-                    f"확인 방법:\n"
-                    f"1. NOTION_PARENT_PAGE_ID 확인\n"
-                    f"2. Integration에 페이지 공유 설정"
-                )
-            else:
-                msg = (
-                    f"❌ Notion 데이터베이스 오류\n\n"
-                    f"📊 총 거래: {len(valid_txs)}개\n"
-                    f"💾 저장 성공: {saved}개\n"
-                )
-                if duplicates > 0:
-                    msg += f"⚠️ 중복 제외: {duplicates}개\n"
-                if failed > 0:
-                    msg += f"❌ 저장 실패: {failed}개\n"
-                msg += (
-                    f"\n⛔️ 데이터베이스 ID가 잘못되었거나\n"
-                    f"integration과 공유되지 않았습니다.\n\n"
-                    f"확인 방법:\n"
-                    f"1. NOTION_DATABASE_ID 확인 (또는 비워두면 자동 생성)\n"
-                    f"2. Integration에 데이터베이스 공유 설정"
-                )
-        else:
-            msg = (
-                f"✅ 처리 완료\n\n"
-                f"📊 총 거래: {len(valid_txs)}개\n"
-                f"💾 저장 성공: {saved}개\n"
-            )
-            if duplicates > 0:
-                msg += f"⚠️ 중복 제외: {duplicates}개\n"
-            if failed > 0:
-                msg += f"❌ 저장 실패: {failed}개"
         
         await sender.send_message(chat_id, msg)
         
